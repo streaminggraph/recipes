@@ -1,0 +1,651 @@
+version: 1
+title: Fraud demo
+contributor: sales@thatdot.com
+summary: Ingests JSON-formatted eventfile and creates relationships.
+description: Generates deviceID, cookieID, customerUUID, userUUID, IP addresses, email address.
+# Note: Sample data (1,000 lines) for this recipe is generated via query to https://www.mockaroo.com/c2f00130.
+ingestStreams:
+  - type: FileIngest
+    path: fraud.json
+    format:
+      type: CypherJson
+      query: |-
+        // SET IDs for nodes
+        MATCH (event), (cookie), (customer), (user), (ipCustomer), (ipGlobal), (device), (email)
+        WHERE id(event) = idFrom('event', $that.timestamp, $that.cookieID, $that.customerUUID)
+          AND id(cookie) = idFrom('cookie', $that.cookieID, $that.customerUUID)
+          AND id(customer) = idFrom('customer', $that.customerUUID)
+          AND id(user) = idFrom('user', $that.customerUUID, $that.email)
+          AND id(ipCustomer) = idFrom('ipCustomer', $that.ipaddress, $that.customerUUID)
+          AND id(ipGlobal) = idFrom('ipGlobal', $that.ipaddress)
+          AND id(device) = idFrom('device', $that.deviceID, $that.customerUUID)
+          AND id(email) = idFrom('email', $that.email, $that.customerUUID)
+
+        //////////////////////////////
+        // Bucketing for counters
+        //////////////////////////////
+        CALL incrementCounter(ipCustomer, "count")
+        CALL incrementCounter(ipGlobal, "count")
+        CALL incrementCounter(device, "count")
+        
+        // Count true vs. false for solved //
+        CALL incrementCounter(ipCustomer, $that.solved)
+        CALL incrementCounter(ipGlobal, $that.solved)
+        
+        // Create timeNode node to provide day/hour/minute bucketing and counting of events //
+        CALL reify.time(datetime($that.timestamp, "yyyy-MM-dd'T'HH:mm:ssX"), ["minute"]) YIELD node AS timeNode
+        CALL incrementCounter(timeNode, "count")
+
+        //////////////////////////////
+        // Events
+        //////////////////////////////
+        SET event = $that, event: event
+        SET event.type = 'event'
+
+        //////////////////////////////
+        // Customer
+        //////////////////////////////
+        SET customer.customerUUID = $that.customerUUID, customer: customer
+        SET customer.type = 'customer'
+
+        //////////////////////////////
+        // Cookies
+        //////////////////////////////
+        SET cookie.id = $that.cookieID
+        SET cookie.customerUUID = $that.customerUUID, cookie: cookie
+
+        // Extract Browser and Version //
+        WITH *, text.regexFirstMatch($that.ua, '(MSIE|(?!Gecko.+)Firefox|(?!AppleWebKit.+Chrome.+)Safari|(?!AppleWebKit.+)Chrome|AppleWebKit(?!.+Chrome|.+Safari)|Gecko(?!.+Firefox))(?: |\\/)([\\d\\.apre]+)') AS r
+        SET cookie.browser = r[1], cookie.browserVer = r[2]
+
+        // Identify last time cookie seen across records
+        SET cookie.lastseen = coll.max([$that.timestamp, coalesce(cookie.lastseen, $that.timestamp)])
+        SET cookie.type = 'cookie'
+        
+        //////////////////////////////
+        // Company IP address
+        //////////////////////////////
+        SET ipCustomer.ipaddress = $that.ipaddress, ipCustomer.customerUUID = $that.customerUUID, ipCustomer: ipCustomer
+        
+        // Percentage of solved vs. failed //
+        SET ipCustomer.solvedPercent = coalesce((ipCustomer.true*1.0)/(ipCustomer.count*1.0)*100.0, 0.0)
+        SET ipCustomer.failedPercent = coalesce((ipCustomer.false*1.0)/(ipCustomer.count*1.0)*100.0, 0.0)
+        SET ipCustomer.state = CASE
+            //Set threshold ratios below for each of three cases// 
+            WHEN ipCustomer.solvedPercent >= 70 THEN 'good'
+            WHEN ipCustomer.solvedPercent >= 50 AND ipCustomer.solvedPercent < 70 THEN 'warn'
+            WHEN ipCustomer.solvedPercent < 50 THEN 'alarm'
+            ELSE 'alarm'
+          END
+        
+        // Identify last time Customer IP address seen across records //
+        SET ipCustomer.lastseen = coll.max([$that.timestamp, coalesce(ipCustomer.lastseen, $that.timestamp)])
+        SET ipCustomer.type = 'ipCustomer'
+
+        //////////////////////////////
+        // Global IP address
+        //////////////////////////////
+        SET ipGlobal.ipaddress = $that.ipaddress, ipGlobal: ipGlobal
+        
+        // Percentage of solved vs. failed //
+        SET ipGlobal.solvedPercent = coalesce((ipGlobal.true*1.0)/(ipGlobal.count*1.0)*100.0, 0.0)
+        SET ipGlobal.failedPercent = coalesce((ipGlobal.false*1.0)/(ipGlobal.count*1.0)*100.0, 0.0)
+        SET ipGlobal.state = CASE
+            //Set threshold ratios below for each of three cases// 
+            WHEN ipGlobal.solvedPercent >= 80 THEN 'good'
+            WHEN ipGlobal.solvedPercent >= 70 AND ipGlobal.solvedPercent < 80 THEN 'warn'
+            WHEN ipGlobal.solvedPercent < 70 THEN 'alarm'
+            ELSE 'alarm'
+          END
+        
+        // Identify last time Global IP address seen across records //
+        SET ipGlobal.lastseen = coll.max([$that.timestamp, coalesce(ipGlobal.lastseen, $that.timestamp)])
+        SET ipGlobal.type = 'ipGlobal'
+
+        //////////////////////////////
+        // Device
+        //////////////////////////////
+        SET device.deviceID = $that.deviceID, device.customerUUID = $that.customerUUID, device.ua = $that.ua, device: device
+        
+        // Identify last time device seen across records //
+        SET device.lastseen = coll.max([$that.timestamp, coalesce(device.lastseen, $that.timestamp)])
+        SET device.type = 'device'
+
+        //////////////////////////////
+        // Email
+        //////////////////////////////
+        SET email.address = $that.email, email.customerUUID = $that.customerUUID, email: email
+        
+        // Identify last time email seen across records
+        SET email.lastseen = coll.max([$that.timestamp, coalesce(email.lastseen, $that.timestamp)])
+        SET email.type = 'email'
+
+        //////////////////////////////
+        // User
+        //////////////////////////////
+        SET user.userUUID = toString(id(user)), user.reputation_score = $that.reputation_score, user.name = toLower(SPLIT($that.email, '@')[0]), user.customerUUID = $that.customerUUID, user: user
+        
+        // Identify first time user seen across records
+        SET user.firstseen = coll.min([$that.timestamp, coalesce(user.firstseen, $that.timestamp)])
+        SET user.type = 'user'
+
+        //////////////////////////////
+        // Create relationship between nodes
+        //////////////////////////////
+        CREATE (event)-[:AT]->(timeNode)
+        CREATE (user)-[:WORKS_FOR]->(customer)
+        CREATE (ipCustomer)-[:FROM_IP]->(ipGlobal)
+        CREATE (cookie)<-[:WITH_COOKIE]-(event)-[:FROM_IP]->(ipCustomer)<-[:FROM_IP]-(device)<-[:USING]-(event)<-[:DID]-(user)<-[:USED_BY]-(email)
+standingQueries:
+  - pattern:
+      type: Cypher
+      query: MATCH (n) RETURN DISTINCT id(n) AS id
+      mode: DistinctId
+    outputs:
+      alarms:
+        type: CypherQuery
+        query: |-
+          MATCH (n) WHERE id(n) = $that.data.id AND n.state = "alarm"
+          RETURN {url: 'http://localhost:8080/api/v1/query/literal/' + toString(strId(n) + '/debug')}
+        andThen:
+          type: LogJSONtoStandardOut
+          url: http://0.0.0.0:9000/hooks/quine
+nodeAppearances:
+    #Event/event Appearance *******************
+  - predicate:
+      propertyKeys: 
+        - solved
+      knownValues:
+        solved: "false"
+      dbLabel: event
+    icon: ion-ios-paper
+    color: "#F44336"
+    size:   
+    label:
+      type: Property
+      key: timestamp
+      prefix: event-
+    #Event/event Appearance *******************
+  - predicate:
+      propertyKeys: []
+      knownValues: {}
+      dbLabel: event
+    icon: ion-ios-paper
+    color: "#32a852"
+    size:   
+    label:
+      type: Property
+      key: timestamp
+      prefix: event-
+     #Per-Customer IP addrress Appearance *******************
+  - predicate:
+      propertyKeys:
+        - state
+      knownValues:
+        state: "good"
+      dbLabel: ipCustomer
+    icon: ion-ios-world-outline
+    color: "#32a852"
+    size: 24
+    label:
+      type: Property
+      key: ipaddress
+      prefix:
+  - predicate:
+      propertyKeys:
+        - state
+      knownValues:
+        state: "alarm"
+      dbLabel: ipCustomer
+    icon: ion-ios-world-outline
+    color: "#cf151e"
+    size: 24
+    label:
+      type: Property
+      key: ipaddress
+      prefix:
+  - predicate:
+      propertyKeys:
+        - state
+      knownValues:
+        state: "warn"
+      dbLabel: ipCustomer
+    icon: ion-ios-world-outline
+    color: "#d68400"
+    size: 24
+    label:
+      type: Property
+      key: ipaddress
+      prefix:
+     #Global IP addrress Appearance *******************
+  - predicate:
+      propertyKeys:
+        - state
+      knownValues:
+        state: "good"
+      dbLabel: ipGlobal
+    icon: ion-ios-world-outline
+    color: "#32a852"
+    size: 48
+    label:
+      type: Property
+      key: ipaddress
+      prefix:
+  - predicate:
+      propertyKeys:
+        - state
+      knownValues:
+        state: "alarm"
+      dbLabel: ipGlobal
+    icon: ion-ios-world-outline
+    color: "#cf151e"
+    size: 48
+    label:
+      type: Property
+      key: ipaddress
+      prefix:
+  - predicate:
+      propertyKeys:
+        - state
+      knownValues:
+        state: "warn"
+      dbLabel: ipGlobal
+    icon: ion-ios-world-outline
+    color: "#d68400"
+    size: 48
+    label:
+      type: Property
+      key: ipaddress
+      prefix:
+     #Cookie Appearance *******************
+  - predicate:
+      propertyKeys: []
+      knownValues: {}
+      dbLabel: cookie
+    icon: ion-social-chrome-outline
+    color: 
+    size:   
+    label:
+      type: Property
+      key: id
+      prefix:
+     #User Appearance *******************
+  - predicate:
+      propertyKeys: []
+      knownValues: {}
+      dbLabel: user
+    icon: ion-ios-contact-outline
+    color: 
+    size:   
+    label:
+      type: Property
+      key: userUUID
+      prefix: user-
+     #Customer Appearance *******************
+  - predicate:
+      propertyKeys: []
+      knownValues: {}
+      dbLabel: customer
+    icon: ion-settings
+    color: 
+    size:   
+    label:
+      type: Property
+      key: customerUUID
+      prefix:
+     #Device Appearance *******************
+  - predicate:
+      propertyKeys: []
+      knownValues: {}
+      dbLabel: device
+    icon: ion-ios-calculator-outline
+    color: 
+    size:   
+    label:
+      type: Property
+      key: deviceID
+      prefix:
+     #Email Appearance *******************
+  - predicate:
+      propertyKeys: []
+      knownValues: {}
+      dbLabel: email
+    icon: ion-email
+    color: 
+    size:   
+    label:
+      type: Property
+      key: address
+      prefix:
+  - predicate:
+      propertyKeys:
+        - period
+      knownValues:
+        period: "day"
+      dbLabel:
+    icon: ion-android-calendar
+    color: 
+    size:
+  - predicate:
+      propertyKeys:
+        - period
+      knownValues:
+        period: "hour"
+      dbLabel:
+    icon: ion-clock
+    color: 
+    size: 32
+  - predicate:
+      propertyKeys:
+        - period
+      knownValues:
+        period: "minute"
+      dbLabel:
+    icon: ion-clock
+    color: 
+    size: 24
+sampleQueries:
+  # provide easy access to node types in the exploration ui
+  - name: One Customer Node
+    query: MATCH (customer:customer) RETURN customer LIMIT 1
+  - name: One user Node
+    query: MATCH (user:user) RETURN user LIMIT 1
+  - name: One email address Node
+    query: MATCH (email:email) RETURN email LIMIT 1
+  - name: One event Node
+    query: MATCH (event:event) RETURN event LIMIT 1
+  - name: One cookie Node
+    query: MATCH (cookie:cookie) RETURN cookie LIMIT 1
+  - name: One device Node
+    query: MATCH (device:device) RETURN device LIMIT 1
+  - name: One Customer IP address
+    query: MATCH (ipCustomer:ipCustomer) RETURN ipCustomer LIMIT 1
+  - name: One Global IP address
+    query: MATCH (ipGlobal:ipGlobal) RETURN ipGlobal LIMIT 1
+  - name: One Global IP address that connects to more than one customer
+    query: MATCH (a)-->(n:ipGlobal)<--(b) RETURN n LIMIT 1
+quickQueries:
+  - predicate:
+      propertyKeys: [ ]
+      knownValues: {}
+    quickQuery:
+      name: Adjacent Nodes
+      querySuffix: MATCH (n)--(m) RETURN DISTINCT m
+      queryLanguage: Cypher
+      sort: Node
+  - predicate:
+      propertyKeys: []
+      knownValues: {}
+    quickQuery:
+      name: Refresh
+      querySuffix: RETURN n
+      queryLanguage: Cypher
+      sort: Node
+  - predicate:
+      propertyKeys: []
+      knownValues: {}
+    quickQuery:
+      name: Local Properties
+      querySuffix: RETURN id(n), properties(n)
+      queryLanguage: Cypher
+      sort: Text
+  - predicate:
+      propertyKeys: [ ]
+      knownValues: {
+        "type": "event"
+      }
+    quickQuery:
+      name: Time Bucket for event
+      querySuffix: MATCH (n)--(m) WHERE strId(n) = idFrom('ipCustomer', n.ipaddress, n.customerUUID) AND m.period = 'minute' RETURN n,m
+      queryLanguage: Cypher
+      sort: Node
+  - predicate:
+      propertyKeys: [ ]
+      knownValues: {
+        "type": "event"
+      }
+    quickQuery:
+      name: Event Details
+      querySuffix: RETURN n.message AS LOG
+      queryLanguage: Cypher
+      sort: Text
+  - predicate:
+      propertyKeys: [ ]
+      knownValues: {
+        "type": "ipCustomer"
+      }
+    quickQuery:
+      name: "[text] Count of connected Events by Customer IP address"
+      querySuffix: MATCH (n)<-[r]-(m:event) WHERE m.ipaddress = n.ipaddress RETURN m.ipaddress AS IP, count(r) AS Events
+      queryLanguage: Cypher
+      sort: Text
+  - predicate:
+      propertyKeys: [ ]
+      knownValues: {
+        "type": "ipCustomer"
+      }
+    quickQuery:
+      name: "[text] List of last twenty (20) connected events ordered chronologically"
+      querySuffix: MATCH (n)<--(m:event) WHERE m.ipaddress = n.ipaddress RETURN m.timestamp AS TIME, m.solved AS SOLVED, m.cookieID AS COOKIE, m.deviceID AS DEVICE, m.email AS EMAIL, "CALL properties.history(idFrom('ipCustomer','"+m.ipaddress+"','"+m.customerUUID+"'), ['count', 'solvedPercent']) YIELD lastUpdatedTime, updates UNWIND updates AS update RETURN update AS UPDATE" AS HISTORY ORDER BY m.timestamp ASC LIMIT 20
+      queryLanguage: Cypher
+      sort: Text
+  - predicate:
+      propertyKeys: [ ]
+      knownValues: {
+        "type": "ipCustomer"
+      }
+    quickQuery:
+      name: "[text] Count of failed attempts from this IP address"
+      querySuffix: MATCH (n:ipCustomer)<-[r]-(o:event) WHERE o.ipaddress = n.ipaddress AND o.solved = 'false' RETURN o.customerUUID AS CUSTOMER, count(r) AS FAILED
+      queryLanguage: Cypher
+      sort: Text
+  - predicate:
+      propertyKeys: [ ]
+      knownValues: {
+        "type": "ipCustomer"
+      }
+    quickQuery:
+      name: "[text] List of failed attempts from this IP address"
+      querySuffix: MATCH (n:ipCustomer)<-[r]-(o:event) WHERE o.ipaddress = n.ipaddress AND o.solved = 'false' RETURN o.timestamp AS DATETIME, o.email AS USER ORDER BY o.timestamp ASC
+      queryLanguage: Cypher
+      sort: Text
+  - predicate:
+      propertyKeys: [ ]
+      knownValues: {
+        "type": "ipCustomer"
+      }
+    quickQuery:
+      name: "[node] Connected Events by Customer"
+      querySuffix: MATCH (n)<-[:FROM_IP]-(m:event) WHERE strId(n) = idFrom('ipCustomer', n.ipaddress, n.customerUUID) AND n.ipaddress = n.ipaddress RETURN n,m
+      queryLanguage: Cypher
+      sort: Node
+  - predicate:
+      propertyKeys: [ ]
+      knownValues: {
+        "type": "ipCustomer"
+      }
+    quickQuery:
+      name: "[node] Connected Global IP node"
+      querySuffix: MATCH (n)-->(m:ipGlobal) WHERE strId(n) = idFrom('ipCustomer', n.ipaddress, n.customerUUID) AND m.ipaddress = n.ipaddress RETURN n,m
+      queryLanguage: Cypher
+      sort: Node
+  - predicate:
+      propertyKeys: [ ]
+      knownValues: {
+        "type": "ipCustomer"
+      }
+    quickQuery:
+      name: "[node] Last twenty (20) connected events"
+      querySuffix: MATCH (n)<--(m:event) WHERE strId(n) = idFrom('ipCustomer', n.ipaddress, n.customerUUID) AND m.ipaddress = n.ipaddress RETURN DISTINCT m ORDER BY m.timestamp ASC LIMIT 20
+      queryLanguage: Cypher
+      sort: Node
+  - predicate:
+      propertyKeys: [ ]
+      knownValues: {
+        "type": "ipGlobal"
+      }
+    quickQuery:
+      name: "[text] Count of connected Customers by IP address"
+      querySuffix: MATCH (n)<-[r]-(m:ipCustomer) WHERE strId(n) = idFrom('ipGlobal', n.ipaddress) AND m.ipaddress = m.ipaddress RETURN n.ipaddress AS IP, count(r) AS Customers
+      queryLanguage: Cypher
+      sort: Text
+  - predicate:
+      propertyKeys: [ ]
+      knownValues: {
+        "type": "ipGlobal"
+      }
+    quickQuery:
+      name: "[text] Count of failed attempts from this IP address across connected customers"
+      querySuffix: MATCH (n)<-[r]-(m:ipCustomer)<-[q]-(o:event) WHERE o.ipaddress = n.ipaddress AND o.solved = 'false' RETURN m.customerUUID AS CUSTOMER, count(q) AS FAILED
+      queryLanguage: Cypher
+      sort: Text
+  - predicate:
+      propertyKeys: [ ]
+      knownValues: {
+        "type": "ipGlobal"
+      }
+    quickQuery:
+      name: "[text] List of customers that Used this IP address"
+      querySuffix: MATCH (n)<-[r]-(m:ipCustomer) WHERE strId(n) = idFrom('ipGlobal', n.ipaddress) AND m.ipaddress = m.ipaddress RETURN m.customerUUID AS Customer
+      queryLanguage: Cypher
+      sort: Text
+  - predicate:
+      propertyKeys: [ ]
+      knownValues: {
+        "type": "user"
+      }
+    quickQuery:
+      name: "[text] List of IP addresses by frequency"
+      querySuffix: MATCH (ipCustomer)<-[]-(event)-[]-(n) WHERE strId(n) = idFrom('user', n.customerUUID, n.email) AND ipCustomer.ipaddress IS NOT NULL AND ipCustomer.customerUUID = n.customerUUID RETURN count(ipCustomer.ipaddress) AS Count, ipCustomer.ipaddress AS IP
+      queryLanguage: Cypher
+      sort: Text
+  - predicate:
+      propertyKeys: [ ]
+      knownValues: {
+        "type": "customer"
+      }
+    quickQuery:
+      name: "[text] List of email addresses by customer"
+      querySuffix: MATCH (email)-[]->(user)-[]->(n) WHERE email.customerUUID = n.customerUUID RETURN count(email.address) AS Count, email.address AS Email ORDER BY Count DESC
+      queryLanguage: Cypher
+      sort: Text
+  - predicate:
+      propertyKeys: [ ]
+      knownValues: {
+        "type": "customer"
+      }
+    quickQuery:
+      name: "[text] List of IP addresses by customer"
+      querySuffix: MATCH (ipCustomer)<-[:FROM_IP]-(event)<-[:DID]-(user)-[:WORKS_FOR]->(n) WHERE ipCustomer.customerUUID = n.customerUUID RETURN count(ipCustomer.ipaddress) AS Count, ipCustomer.ipaddress AS IP ORDER BY Count DESC
+      queryLanguage: Cypher
+      sort: Text
+  - predicate:
+      propertyKeys: [ ]
+      knownValues: {
+        "type": "customer"
+      }
+    quickQuery:
+      name: "[text] List of failed attempts by customer sorted chronologically"
+      querySuffix: MATCH (event:event)<-[:DID]-(user:user)-[:WORKS_FOR]->(n) WHERE event.customerUUID = n.customerUUID AND event.solved = 'false' RETURN event.timestamp AS Datetime, user.userUUID AS User ORDER BY event.timestamp DESC
+      queryLanguage: Cypher
+      sort: Text
+  - predicate:
+      propertyKeys: [ ]
+      knownValues: {
+        "type": "user"
+      }
+    quickQuery:
+      name: "[text] List of devices by user"
+      querySuffix: MATCH (device:device)<-[]-(event)-[]-(n) WHERE device.customerUUID = n.customerUUID RETURN count(device) AS Count, device.deviceID AS Device
+      queryLanguage: Cypher
+      sort: Text
+  - predicate:
+      propertyKeys: [ ]
+      knownValues: {
+        "type": "user"
+      }
+    quickQuery:
+      name: "[text] List of cookies by user chronologically"
+      querySuffix: MATCH (cookie)<-[]-(event)-[]-(n) WHERE cookie.customerUUID = n.customerUUID AND cookie.id IS NOT NULL RETURN cookie.lastseen AS Last_Seen, cookie.id AS Cookie ORDER BY cookie.lastseen
+      queryLanguage: Cypher
+      sort: Text
+  - predicate:
+      propertyKeys: [ ]
+      knownValues: {
+        "type": "user"
+      }
+    quickQuery:
+      name: "[text] List of email address(es) used by user"
+      querySuffix: MATCH (n)--(m:email) WHERE strId(n) = idFrom('ipCustomer', n.ipaddress, n.customerUUID) AND m.customerUUID = n.customerUUID RETURN count(m) AS Count, m.address AS Email
+      queryLanguage: Cypher
+      sort: Text
+  - predicate:
+      propertyKeys: [ ]
+      knownValues: {
+        "type": "user"
+      }
+    quickQuery:
+      name: "[node] Email address(es) used by user"
+      querySuffix: MATCH (n)--(m:email) WHERE strId(n) = idFrom('ipCustomer', n.ipaddress, n.customerUUID) AND m.customerUUID = n.customerUUID RETURN m
+      queryLanguage: Cypher
+      sort: Node
+  - predicate:
+      propertyKeys: [ ]
+      knownValues: {
+        "type": "email"
+      }
+    quickQuery:
+      name: "[node] User associated with email address"
+      querySuffix: MATCH (m:user)<-[:USED_BY]-(n:email) WHERE m.customerUUID = n.customerUUID RETURN m
+      queryLanguage: Cypher
+      sort: Node
+  - predicate:
+      propertyKeys: [ ]
+      knownValues: {
+        "type": "user"
+      }
+    quickQuery:
+      name: "[node] Customer that user works for"
+      querySuffix: MATCH (n)--(m:customer) WHERE strId(n) = idFrom('ipCustomer', n.ipaddress, n.customerUUID) AND m.customerUUID = n.customerUUID RETURN m
+      queryLanguage: Cypher
+      sort: Node
+  - predicate:
+      propertyKeys: [ ]
+      knownValues: {
+        "type": "user"
+      }
+    quickQuery:
+      name: "[node] One event for user"
+      querySuffix: MATCH (m:event)<-[:DID]-(n:user) WHERE strId(n) = idFrom('user', n.customerUUID, n.email) AND m.customerUUID = n.customerUUID RETURN m LIMIT 1
+      queryLanguage: Cypher
+      sort: Node
+  - predicate:
+      propertyKeys: [ ]
+      knownValues: {
+        "type": "user"
+      }
+    quickQuery:
+      name: "[node] One solved challenge event for user"
+      querySuffix: MATCH (m:event)<-[:DID]-(n:user) WHERE strId(n) = idFrom('user', n.customerUUID, n.email) AND m.customerUUID = n.customerUUID AND m.solved = 'true' RETURN m LIMIT 1
+      queryLanguage: Cypher
+      sort: Node
+  - predicate:
+      propertyKeys: [ ]
+      knownValues: {
+        "type": "user"
+      }
+    quickQuery:
+      name: "[node] One failed challenge event for user"
+      querySuffix: MATCH (m:event)<-[:DID]-(n:user) WHERE strId(n) = idFrom('user', n.customerUUID, n.email) AND m.customerUUID = n.customerUUID AND m.solved = 'false' RETURN m LIMIT 1
+      queryLanguage: Cypher
+      sort: Node
+  - predicate:
+      propertyKeys: [ ]
+      knownValues: {
+        "type": "customer"
+      }
+    quickQuery:
+      name: "[node] One user that works for this customer"
+      querySuffix: MATCH (user)-[]->(n) WHERE user.customerUUID = n.customerUUID RETURN user LIMIT 1
+      queryLanguage: Cypher
+      sort: Node

@@ -5,3 +5,6 @@ https://github.com/streaminggraph/recipes/blob/1fd20f7cdaeabbbcf7c9de82065a3f7a1
 
 This is the standing query:  
 https://github.com/streaminggraph/recipes/blob/0afcddde1cf754db81c23074892a31180c3e3247/challenge-response-fraud-detection-recipe/fraud.yml#L139-L152
+
+THis is it
+https://github.com/streaminggraph/recipes/blob/a9d5f75fe54bfa547c95a4a45b1f9af6df9a80af/challenge-response-fraud-detection-recipe/fraud.yml#L70-L79

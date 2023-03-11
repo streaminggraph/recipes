@@ -4,7 +4,7 @@ The community is the heart of all open-source projects. We welcome contributions
 
 ## Code of Conduct
 
-All community members must be good citizens; be sure to read the [Code of Conduct](https://github.com/streaminggraph/recipes/blob/main/code-of-conduct.md) page to understand what this means.
+All community members must be good citizens; be sure to read the [Code of Conduct](https://github.com/streaminggraph/recipes/blob/main/CODE_OF_CONDUCT.md) page to understand what this means.
 
 ## Contributing Code
 
